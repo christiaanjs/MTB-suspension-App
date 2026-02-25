@@ -188,7 +188,25 @@ class BikeViewModel: ObservableObject {
             frontAxlePath.append(frontRelativeToBB)
         }
         
-        return AnalysisResults(states: states, axlePath: axlePath, frontAxlePath: frontAxlePath)
+        // Calculate leverage ratio as finite difference: dWheelTravel / dShockStroke
+                for i in 0..<states.count {
+                    if i == 0 {
+                        // Forward difference for first point
+                        if states.count > 1 {
+                            let dTravel = states[1].travelMM - states[0].travelMM
+                            states[0].leverageRatio = dTravel / stepSize
+                        }
+                    } else {
+                        // Backward difference
+                        let dTravel = states[i].travelMM - states[i - 1].travelMM
+                        states[i].leverageRatio = dTravel / stepSize
+                    }
+                    
+                    // Recalculate wheel rate with actual leverage ratio
+                    states[i].wheelRate = geometry.shockSpringRate / (states[i].leverageRatio * states[i].leverageRatio)
+                }
+                
+                return AnalysisResults(states: states, axlePath: axlePath, frontAxlePath: frontAxlePath)
     }
     
     // Establish rigid triangle at top-out (shock fully extended at shockETE)
@@ -211,17 +229,12 @@ class BikeViewModel: ObservableObject {
             return (geometry.shockSwingarmMountDistance, geometry.swingarmLength, geometry.swingarmLength, 0, true)
         }
         
-        // Choose eye with LARGEST X value (most forward) - this determines triangle orientation
-        let correctEyeIndex = eyeCandidates[0].x > eyeCandidates[1].x ? 0 : 1
-        let chosenEye = eyeCandidates[correctEyeIndex]
-        
         // Find axle: swingarmLength from pivot, on ground (Y = wheelRadius)
         let verticalDist = geometry.rearWheelRadius - pivot.y
         
         // Validate geometry - swingarm must be long enough to reach ground
         let horizontalDistSquared = geometry.swingarmLength * geometry.swingarmLength - verticalDist * verticalDist
         guard horizontalDistSquared >= 0 else {
-            // Invalid geometry - return safe defaults
             return (geometry.shockSwingarmMountDistance, geometry.swingarmLength, geometry.swingarmLength, 0, true)
         }
         
@@ -233,22 +246,76 @@ class BikeViewModel: ObservableObject {
         // Choose axle behind pivot (more negative X, i.e., minimum X)
         let axle = axle1.x < axle2.x ? axle1 : axle2
         
+        // Choose correct eye candidate by physical test:
+        // Compress shock by a tiny amount — the correct eye will cause axle Y to INCREASE
+        // (wheel pushes up into frame when suspension compresses)
+        let testShockLength = geometry.shockETE - 0.1  // tiny compression
+        
+        func testAxleMovement(eyeIndex: Int) -> Double {
+            let eye = eyeCandidates[eyeIndex]
+            let eyeToAxleDist = distance(eye, axle)
+            let pivotToEyeDist = distance(pivot, eye)
+            let pivotToAxleDist = distance(pivot, axle)
+            
+            // Determine angle sign for this eye candidate
+            let cosAngle = (pivotToEyeDist * pivotToEyeDist + pivotToAxleDist * pivotToAxleDist - eyeToAxleDist * eyeToAxleDist) /
+                           (2 * pivotToEyeDist * pivotToAxleDist)
+            let angleAtPivot = acos(min(1, max(-1, cosAngle)))
+            let pivotToEyeAngle = angle(from: pivot, to: eye)
+            
+            let testPlus = Point2D(
+                x: pivot.x + pivotToAxleDist * cos(pivotToEyeAngle + angleAtPivot),
+                y: pivot.y + pivotToAxleDist * sin(pivotToEyeAngle + angleAtPivot)
+            )
+            let testMinus = Point2D(
+                x: pivot.x + pivotToAxleDist * cos(pivotToEyeAngle - angleAtPivot),
+                y: pivot.y + pivotToAxleDist * sin(pivotToEyeAngle - angleAtPivot)
+            )
+            let usePositive = distance(testPlus, axle) < distance(testMinus, axle)
+            
+            // Now find where the eye goes with the slightly compressed shock
+            let perturbedEyes = circleCircleIntersection(
+                center1: pivot,
+                radius1: geometry.shockSwingarmMountDistance,
+                center2: frameMount,
+                radius2: testShockLength
+            )
+            guard perturbedEyes.count == 2 else { return -9999 }
+            let perturbedEye = perturbedEyes[eyeIndex]
+            
+            // Reconstruct axle with perturbed eye
+            let newPEDist = distance(pivot, perturbedEye)
+            let newPEAngle = angle(from: pivot, to: perturbedEye)
+            let newCosAngle = (newPEDist * newPEDist + pivotToAxleDist * pivotToAxleDist - eyeToAxleDist * eyeToAxleDist) /
+                              (2 * newPEDist * pivotToAxleDist)
+            let newAngleAtPivot = acos(min(1, max(-1, newCosAngle)))
+            
+            let newAxleAngle = usePositive ? (newPEAngle + newAngleAtPivot) : (newPEAngle - newAngleAtPivot)
+            let newAxleY = pivot.y + pivotToAxleDist * sin(newAxleAngle)
+            
+            // Return the Y movement (positive = axle moved up = correct)
+            return newAxleY - axle.y
+        }
+        
+        let movement0 = testAxleMovement(eyeIndex: 0)
+        let movement1 = testAxleMovement(eyeIndex: 1)
+        
+        // Pick the candidate where compression causes axle to move UP
+        let correctEyeIndex = movement0 > movement1 ? 0 : 1
+        let chosenEye = eyeCandidates[correctEyeIndex]
+        
         // Calculate three side lengths - these are FIXED for the rigid triangle
         let pivotToEyeDist = distance(pivot, chosenEye)
         let pivotToAxleDist = distance(pivot, axle)
         let eyeToAxleDist = distance(chosenEye, axle)
         
         // Determine which angle sign to use (+ or -) from pivot-eye line
-        // Calculate using law of cosines what the angle should be
-        let cosAngle = (pivotToEyeDist * pivotToEyeDist + pivotToAxleDist * pivotToAxleDist - eyeToAxleDist * eyeToAxleDist) / 
+        let cosAngle = (pivotToEyeDist * pivotToEyeDist + pivotToAxleDist * pivotToAxleDist - eyeToAxleDist * eyeToAxleDist) /
                        (2 * pivotToEyeDist * pivotToAxleDist)
         let angleAtPivot = acos(cosAngle)
         
         let pivotToEyeAngle = angle(from: pivot, to: chosenEye)
-        let pivotToAxleAngle = angle(from: pivot, to: axle)
         
-        // Determine if we need to ADD or SUBTRACT the angle
-        // Check which one matches the actual axle position
         let testAnglePlus = pivotToEyeAngle + angleAtPivot
         let testAngleMinus = pivotToEyeAngle - angleAtPivot
         
@@ -264,11 +331,12 @@ class BikeViewModel: ObservableObject {
         let distPlus = distance(testAxlePlus, axle)
         let distMinus = distance(testAxleMinus, axle)
         
-        let axleAngleIsPositive = distPlus < distMinus  // true = use +angle, false = use -angle
+        let axleAngleIsPositive = distPlus < distMinus
         
         print("=== RIGID TRIANGLE ESTABLISHED AT TOP-OUT ===")
         print("Triangle sides: pivot->eye=\(pivotToEyeDist), eye->axle=\(eyeToAxleDist)")
         print("Using eye candidate index: \(correctEyeIndex) (eye at X=\(String(format: "%.1f", chosenEye.x)))")
+        print("Eye0 movement: \(String(format: "%.4f", movement0)), Eye1 movement: \(String(format: "%.4f", movement1))")
         print("Axle angle: \(axleAngleIsPositive ? "POSITIVE" : "NEGATIVE") from pivot-eye line")
         print("==============================================\n")
         
@@ -415,7 +483,7 @@ class BikeViewModel: ObservableObject {
         
         // Calculate leverage ratio (approximation based on shock stroke)
         // Leverage = wheel travel change / shock travel change
-        let leverageRatio = 2.5  // Simplified constant for now to avoid recursion
+        let leverageRatio = 0.0 // ill be calculated as finite difference in runKinematicAnalysis
         
         // Chain calculations - must account for full chain path including idler
         let chainringPos = Point2D(x: bbPos.x + geometry.chainringOffsetX, y: bbPos.y + geometry.chainringOffsetY)
