@@ -29,7 +29,7 @@ struct ContentView: View {
             InputPanel(viewModel: viewModel)
                 .navigationSplitViewColumnWidth(min: 300, ideal: 350, max: 400)
         } detail: {
-            // Main content area
+            // Main content area;seeuarvaoiwvcaoeirjg
             VStack(spacing: 0) {
                 // Animation window
                 AnimationView(viewModel: viewModel)
